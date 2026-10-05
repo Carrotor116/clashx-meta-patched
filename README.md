@@ -22,14 +22,14 @@
 1. 在 GitHub 上新建一个**公开**仓库（公开仓库的 macOS 构建免费），把本目录推上去。
 2. 打开仓库的 Actions 页面，启用 workflow，然后对 **Build patched ClashX Meta** 手动点 Run workflow。
    - 编译不过的话，大概率是 Xcode 版本问题。可以在 `xcode` 里填一个版本号（如 `26.4`），或在 `runner` 里换一台机器再试。
-3. 构建完成后，到 Releases 下载 `ClashX Meta.zip`，然后安装：
+3. 构建完成后，到 Releases 下载 `ClashX.Meta.zip`，然后安装（旧版本会移到 `~/Downloads/ClashX Meta.old.app`，方便回退）：
 
 ```bash
 osascript -e 'quit app "ClashX Meta"'
 ```
 
 ```bash
-cd ~/Downloads && rm -rf "ClashX Meta.app" && ditto -x -k "ClashX Meta.zip" . && rm -rf "/Applications/ClashX Meta.app" && mv "ClashX Meta.app" /Applications/ && xattr -cr "/Applications/ClashX Meta.app" && open "/Applications/ClashX Meta.app"
+cd ~/Downloads && rm -rf "ClashX Meta.app" "ClashX Meta.old.app" && ditto -x -k ClashX.Meta.zip . && mv "/Applications/ClashX Meta.app" "ClashX Meta.old.app" && mv "ClashX Meta.app" /Applications/ && xattr -cr "/Applications/ClashX Meta.app" && open "/Applications/ClashX Meta.app"
 ```
 
 bundle ID 和官方相同，配置、提权助手都照常使用。
