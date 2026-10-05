@@ -1,0 +1,173 @@
+name: Build patched ClashX Meta
+
+on:
+  schedule:
+    - cron: '23 2 * * *' # daily, UTC
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 'Upstream tag to build, e.g. v1.4.46 (default: latest release)'
+        required: false
+      force:
+        description: 'Rebuild even if this tag was already released here'
+        type: boolean
+        default: false
+      runner:
+        description: 'macOS runner label'
+        required: false
+        default: 'macos-26'
+      xcode:
+        description: 'Xcode version, e.g. 26.4 (default: newest stable on the runner)'
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: MetaCubeX/ClashX.Meta
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      build: ${{ steps.tag.outputs.build }}
+    steps:
+      - id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.upstream_tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          tag="${INPUT_TAG:-$(gh release view -R "$UPSTREAM" --json tagName -q .tagName)}"
+          if [ -z "$tag" ]; then
+            echo "::error::failed to resolve upstream release tag"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+          if [ "$FORCE" != "true" ] && gh release view "$tag-patched" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "$tag-patched already released, nothing to do"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "will build $tag"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ${{ inputs.runner || 'macos-26' }}
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: checkout patches
+        uses: actions/checkout@v6
+        with:
+          path: patched
+
+      - name: checkout upstream
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ needs.check.outputs.tag }}
+          # full history lets `git am --3way` merge around upstream changes
+          fetch-depth: 0
+          path: src
+
+      - name: apply patches
+        working-directory: src
+        run: |
+          am() { git -c user.name=ci -c user.email=ci@localhost am --3way "$@"; }
+          am ../patched/patches/*.patch
+
+          # optional patches are skipped with a warning when they no longer apply
+          skipped=""
+          for p in ../patched/patches/optional/*.patch; do
+            [ -e "$p" ] || continue
+            if ! am "$p"; then
+              git am --abort
+              echo "::warning::skipped $(basename "$p"): no longer applies to $TAG"
+              skipped="$skipped $(basename "$p")"
+            fi
+          done
+          echo "SKIPPED_PATCHES=$skipped" >> "$GITHUB_ENV"
+          git log --oneline "$TAG"..HEAD
+
+      - name: select xcode
+        env:
+          XCODE: ${{ inputs.xcode }}
+        run: |
+          if [ -n "$XCODE" ]; then
+            app="/Applications/Xcode_$XCODE.app"
+          else
+            app=$(ls -d /Applications/Xcode_*.app | grep -v -i -E 'beta|release_candidate' | sort -V | tail -1)
+          fi
+          sudo xcode-select -s "$app/Contents/Developer"
+          xcodebuild -version
+
+      - name: install deps
+        working-directory: src
+        run: |
+          # upstream pins the core version in its own workflow
+          mihomo_tag=$(sed -n 's/^ *MIHOMO_TAG: *//p' .github/workflows/main.yml | head -1)
+          echo "mihomo: ${mihomo_tag:-latest}"
+          bash install_dependency.sh "$mihomo_tag"
+          xcodebuild -resolvePackageDependencies -project ClashX.xcodeproj
+          echo "MIHOMO_TAG=$mihomo_tag" >> "$GITHUB_ENV"
+
+      - name: build infos
+        working-directory: src
+        run: |
+          plist=ClashX/Info.plist
+          # same build number as the official release of this tag
+          build=$(git rev-list --count origin/master.."$TAG")
+          /usr/libexec/PlistBuddy -c "Set CFBundleVersion $build" $plist
+          /usr/libexec/PlistBuddy -c "Set CFBundleShortVersionString $TAG" $plist
+          /usr/libexec/PlistBuddy -c "Add coreVersion string ${MIHOMO_TAG:-latest}" $plist
+          /usr/libexec/PlistBuddy -c "Add gitBranch string $TAG-patched" $plist
+          /usr/libexec/PlistBuddy -c "Add gitCommit string $(git rev-parse --short=7 HEAD)" $plist
+          /usr/libexec/PlistBuddy -c "Add buildTime string $(date +%Y-%m-%d\ %H:%M)" $plist
+
+          # Point Sparkle at an empty appcast in this repo, so the app never
+          # offers the official build (which would replace this one).
+          feed="https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_REF_NAME/appcast.xml"
+          /usr/libexec/PlistBuddy -c "Set SUFeedURL $feed" $plist || /usr/libexec/PlistBuddy -c "Add SUFeedURL string $feed" $plist
+
+          for key in CFBundleVersion CFBundleShortVersionString coreVersion gitBranch gitCommit buildTime SUFeedURL; do
+            echo "$key: $(/usr/libexec/PlistBuddy -c "Print $key" $plist)"
+          done
+
+      - name: build
+        working-directory: src
+        run: |
+          xcodebuild archive -project ClashX.xcodeproj -scheme ClashX\ Meta -archivePath archive/ClashX.xcarchive -showBuildTimingSummary -allowProvisioningUpdates
+
+      - name: create zip
+        working-directory: src
+        run: ditto -c -k --sequesterRsrc --keepParent archive/ClashX.xcarchive/Products/Applications/ClashX\ Meta.app "../ClashX Meta.zip"
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ClashX Meta ${{ env.TAG }}-patched
+          path: ClashX Meta.zip
+
+      - name: release
+        run: |
+          notes="Upstream [$TAG](https://github.com/$UPSTREAM/releases/tag/$TAG) with the patches in [patches/](https://github.com/$GITHUB_REPOSITORY/tree/$GITHUB_SHA/patches). mihomo ${MIHOMO_TAG:-latest}."
+          if [ -n "${SKIPPED_PATCHES// /}" ]; then
+            notes="$notes
+
+          **Skipped (no longer apply):**$SKIPPED_PATCHES"
+          fi
+          gh release delete "$TAG-patched" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG-patched" "ClashX Meta.zip" -R "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "ClashX Meta $TAG (patched)" \
+            --notes "$notes"

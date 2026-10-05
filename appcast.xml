@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Intentionally empty: patched builds point Sparkle here so the app never
+     offers the official build, which would replace the patched one. -->
+<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+  <channel>
+    <title>ClashX Meta (patched)</title>
+  </channel>
+</rss>

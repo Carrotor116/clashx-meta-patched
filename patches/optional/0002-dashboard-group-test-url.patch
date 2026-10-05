@@ -1,0 +1,110 @@
+From 6ee60c23fe2edfac1d6387d4f2bf76fad9b07ffa Mon Sep 17 00:00:00 2001
+From: nonu <nonu@a>
+Date: Mon, 5 Oct 2026 00:50:04 +0800
+Subject: [PATCH] Dashboard: benchmark proxy groups with their own test URL
+
+Same as the menu: group cards test against the group's own url and show
+the delays measured against it.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ ClashX/Dashboard/Models/DBProxyStorage.swift     | 16 +++++++++++++---
+ .../ContentTabs/Proxies/ProxyGroupCard.swift     |  6 +++++-
+ .../Views/ContentTabs/Proxies/ProxyRowView.swift |  2 +-
+ 3 files changed, 19 insertions(+), 5 deletions(-)
+
+diff --git a/ClashX/Dashboard/Models/DBProxyStorage.swift b/ClashX/Dashboard/Models/DBProxyStorage.swift
+index 8d96c1b..bba7075 100644
+--- a/ClashX/Dashboard/Models/DBProxyStorage.swift
++++ b/ClashX/Dashboard/Models/DBProxyStorage.swift
+@@ -57,6 +57,9 @@ class DBProxyGroup: ObservableObject, Identifiable {
+ 		}
+ 	}
+ 	@Published var hidden: Bool
++	
++	var delaySource: ProxyDelaySource
++	var expectedStatus: String?
+     
+     init(_ group: ClashProxy, resp: ClashProxyResp) {
+         name = group.name
+@@ -64,10 +67,13 @@ class DBProxyGroup: ObservableObject, Identifiable {
+         now = group.now
+         hidden = group.hidden ?? false
+         isOpen = !ProxyGroupCollapseStore.shared.isCollapsed(group.name)
++        let delaySource = ProxyDelaySource(group: group)
++        self.delaySource = delaySource
++        expectedStatus = group.expectedStatus
+ 
+         proxies = group.all?.compactMap { name in
+             resp.proxiesMap[name]
+-        }.map(DBProxy.init) ?? []
++        }.map { DBProxy($0, delaySource: delaySource) } ?? []
+         
+         currentProxy = proxies.first {
+             $0.name == now
+@@ -78,6 +84,8 @@ class DBProxyGroup: ObservableObject, Identifiable {
+         name = other.name
+         type = other.type
+         hidden = other.hidden
++        delaySource = other.delaySource
++        expectedStatus = other.expectedStatus
+         now = other.now
+         proxies = other.proxies
+         currentProxy = proxies.first { $0.name == now }
+@@ -90,6 +98,7 @@ class DBProxy: ObservableObject {
+ 	@Published var type: ClashProxyType
+ 	@Published var udpString: String
+ 	@Published var tfo: Bool
++	let delaySource: ProxyDelaySource
+ 	
+ 	var delay: Int {
+ 		didSet {
+@@ -101,12 +110,13 @@ class DBProxy: ObservableObject {
+ 	@Published var delayString: String
+ 	@Published var delayColor: Color
+ 	
+-	init(_ proxy: ClashProxy) {
++	init(_ proxy: ClashProxy, delaySource: ProxyDelaySource) {
+ 		id = proxy.id ?? UUID().uuidString
+ 		name = proxy.name
+ 		type = proxy.type
+ 		tfo = proxy.tfo
+-		delay = proxy.history.last?.delayInt ?? 0
++		self.delaySource = delaySource
++		delay = proxy.delayHistory(from: delaySource).last?.delayInt ?? 0
+ 				
+ 		udpString = {
+ 			if proxy.udp {
+diff --git a/ClashX/Dashboard/Views/ContentTabs/Proxies/ProxyGroupCard.swift b/ClashX/Dashboard/Views/ContentTabs/Proxies/ProxyGroupCard.swift
+index ba080d7..6b5e19a 100644
+--- a/ClashX/Dashboard/Views/ContentTabs/Proxies/ProxyGroupCard.swift
++++ b/ClashX/Dashboard/Views/ContentTabs/Proxies/ProxyGroupCard.swift
+@@ -237,7 +237,11 @@ struct ProxyGroupCard: View {
+ 		guard !isTesting else { return }
+ 		isTesting = true
+ 		defer { isTesting = false }
+-		let delays = await ProxyHealthCheckManager.shared.getGroupDelay(groupName: proxyGroup.name)
++		let delays = await ProxyHealthCheckManager.shared.getGroupDelay(
++			groupName: proxyGroup.name,
++			url: proxyGroup.delaySource.url,
++			expectedStatus: proxyGroup.expectedStatus
++		)
+ 		proxyGroup.proxies.enumerated().forEach {
+ 			var delay = 0
+ 			if let d = delays[$0.element.name], d != 0 {
+diff --git a/ClashX/Dashboard/Views/ContentTabs/Proxies/ProxyRowView.swift b/ClashX/Dashboard/Views/ContentTabs/Proxies/ProxyRowView.swift
+index 9651313..dbc2054 100644
+--- a/ClashX/Dashboard/Views/ContentTabs/Proxies/ProxyRowView.swift
++++ b/ClashX/Dashboard/Views/ContentTabs/Proxies/ProxyRowView.swift
+@@ -81,7 +81,7 @@ struct ProxyRowView: View {
+ 		guard !isTesting else { return }
+ 		isTesting = true
+ 		defer { isTesting = false }
+-		let delay = await ApiRequest.getProxyDelay(proxyName: proxy.name)
++		let delay = await ApiRequest.getProxyDelay(proxyName: proxy.name, url: proxy.delaySource.url)
+ 		proxy.delay = delay
+ 	}
+ }
+-- 
+2.50.1 (Apple Git-155)
+

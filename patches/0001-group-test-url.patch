@@ -1,0 +1,340 @@
+From c57c503eb8c273b6a1f7d4d8126314ba360b49fb Mon Sep 17 00:00:00 2001
+From: nonu <nonu@a>
+Date: Mon, 5 Oct 2026 00:50:04 +0800
+Subject: [PATCH] Benchmark proxy groups with their own test URL
+
+Groups that set `url` in the config are now benchmarked against it
+instead of the global benchmark URL, and their menu items show only the
+delays measured against that URL (mihomo keeps them per URL in `extra`).
+Groups without their own url keep using the global benchmark URL and
+prefer its records. The top-level benchmark also tests select groups
+that have their own url.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ ClashX/General/ApiRequest.swift               | 12 +++--
+ ClashX/General/Managers/MenuItemFactory.swift |  2 +-
+ .../Managers/ProxyHealthCheckManager.swift    | 17 ++++++-
+ ClashX/Models/ClashProxy.swift                | 47 +++++++++++++++++++
+ ClashX/Views/ProxyDelayHistoryMenu.swift      |  6 ++-
+ .../Views/ProxyGroupSpeedTestMenuItem.swift   | 12 ++++-
+ ClashX/Views/ProxyItemView.swift              |  5 +-
+ ClashX/Views/ProxyMenuItem.swift              | 14 ++++--
+ 8 files changed, 98 insertions(+), 17 deletions(-)
+
+diff --git a/ClashX/General/ApiRequest.swift b/ClashX/General/ApiRequest.swift
+index 50aee1d..6e9e642 100644
+--- a/ClashX/General/ApiRequest.swift
++++ b/ClashX/General/ApiRequest.swift
+@@ -262,12 +262,12 @@ class ApiRequest {
+         return mergedProxyInfo
+     }
+ 
+-    static func getProxyDelay(proxyName: String) async -> Int {
++    static func getProxyDelay(proxyName: String, url: String? = nil) async -> Int {
+         do {
+             let data = try await req(
+                 "/proxies/\(proxyName.encoded)/delay",
+                 method: .GET,
+-                parameters: ["timeout": 2500, "url": ConfigManager.shared.benchMarkUrl]
++                parameters: ["timeout": 2500, "url": url ?? ConfigManager.shared.benchMarkUrl]
+             )
+             .validate()
+             .responseData
+@@ -277,12 +277,16 @@ class ApiRequest {
+         }
+     }
+ 
+-    static func getGroupDelay(groupName: String) async -> [String: Int] {
++    static func getGroupDelay(groupName: String, url: String? = nil, expectedStatus: String? = nil) async -> [String: Int] {
++        var parameters: [String: Any] = ["timeout": 2500, "url": url ?? ConfigManager.shared.benchMarkUrl]
++        if let expectedStatus, !expectedStatus.isEmpty {
++            parameters["expected"] = expectedStatus
++        }
+         do {
+             return try await req(
+                 "/group/\(groupName.encoded)/delay",
+                 method: .GET,
+-                parameters: ["timeout": 2500, "url": ConfigManager.shared.benchMarkUrl]
++                parameters: parameters
+             )
+             .validate()
+             .responseDecodable([String: Int].self)
+diff --git a/ClashX/General/Managers/MenuItemFactory.swift b/ClashX/General/Managers/MenuItemFactory.swift
+index c62709e..b7f3aa4 100644
+--- a/ClashX/General/Managers/MenuItemFactory.swift
++++ b/ClashX/General/Managers/MenuItemFactory.swift
+@@ -208,7 +208,7 @@ class MenuItemFactory {
+                 proxyMenuItem.state = .on
+             }
+ 
+-            proxyMenuItem.submenu = ProxyDelayHistoryMenu(proxy: proxy)
++            proxyMenuItem.submenu = ProxyDelayHistoryMenu(proxy: proxy, delaySource: proxyMenuItem.delaySource)
+ 
+             submenu.addItem(proxyMenuItem)
+         }
+diff --git a/ClashX/General/Managers/ProxyHealthCheckManager.swift b/ClashX/General/Managers/ProxyHealthCheckManager.swift
+index df28654..f4ceb68 100644
+--- a/ClashX/General/Managers/ProxyHealthCheckManager.swift
++++ b/ClashX/General/Managers/ProxyHealthCheckManager.swift
+@@ -20,8 +20,8 @@ final class ProxyHealthCheckManager {
+         await ApiRequest.healthCheck(proxy: name)
+     }
+ 
+-    func getGroupDelay(groupName: ClashProxyName) async -> [String: Int] {
+-        await ApiRequest.getGroupDelay(groupName: groupName)
++    func getGroupDelay(groupName: ClashProxyName, url: String? = nil, expectedStatus: String? = nil) async -> [String: Int] {
++        await ApiRequest.getGroupDelay(groupName: groupName, url: url, expectedStatus: expectedStatus)
+     }
+ 
+     func healthCheckOnNetworkChange() async {
+@@ -88,6 +88,13 @@ final class ProxyHealthCheckManager {
+         }
+ 
+         let resp = await ApiRequest.getMergedProxyData()
++        // Select groups with their own url also get benchmarked against it;
++        // auto groups are skipped as testing them clears their fixed proxy.
++        let urlGroups = resp.proxyGroups.compactMap { proxyGroup -> (name: ClashProxyName, url: String)? in
++            let source = ProxyDelaySource(group: proxyGroup)
++            guard proxyGroup.type == .select, source.isGroupUrl else { return nil }
++            return (proxyGroup.name, source.url)
++        }
+ 
+         await withTaskGroup(of: Void.self) { group in
+             resp.enclosingProviderResp?.providers.forEach { name, _ in
+@@ -101,6 +108,12 @@ final class ProxyHealthCheckManager {
+                     _ = await ApiRequest.getProxyDelay(proxyName: proxy)
+                 }
+             }
++
++            urlGroups.forEach { urlGroup in
++                group.addTask {
++                    _ = await ApiRequest.getGroupDelay(groupName: urlGroup.name, url: urlGroup.url)
++                }
++            }
+         }
+     }
+ }
+diff --git a/ClashX/Models/ClashProxy.swift b/ClashX/Models/ClashProxy.swift
+index 34b4e80..0649bb1 100644
+--- a/ClashX/Models/ClashProxy.swift
++++ b/ClashX/Models/ClashProxy.swift
+@@ -123,6 +123,12 @@ class ClashProxySpeedHistory: Codable {
+     lazy var displayString: String = "\(dateDisplay) \(delayDisplay)"
+ }
+ 
++/// Delay records the core keeps per test URL (`extra` in the proxies API).
++class ClashProxyDelayState: Codable {
++    let alive: Bool?
++    let history: [ClashProxySpeedHistory]?
++}
++
+ class ClashProxy: Codable {
+ 	let id: String?
+     let name: ClashProxyName
+@@ -131,6 +137,9 @@ class ClashProxy: Codable {
+     let history: [ClashProxySpeedHistory]
+     let now: ClashProxyName?
+     let alive: Bool?
++    let testUrl: String?
++    let expectedStatus: String?
++    let extra: [String: ClashProxyDelayState]?
+     weak var enclosingResp: ClashProxyResp?
+     weak var enclosingProvider: ClashProvider?
+ 	
+@@ -173,6 +182,7 @@ class ClashProxy: Codable {
+ 
+     private enum CodingKeys: String, CodingKey {
+         case type, all, history, now, name, udp, xudp, tfo, id, alive, hidden
++        case testUrl, expectedStatus, extra
+     }
+ 
+     lazy var maxProxyNameLength: CGFloat = {
+@@ -196,6 +206,43 @@ class ClashProxy: Codable {
+     }()
+ }
+ 
++/// Which URL a group benchmarks with and whose delay records it shows: its
++/// own `url` from the config, otherwise the global benchmark URL.
++struct ProxyDelaySource {
++    let url: String
++    /// Set when the group has its own `url`; then records of other URLs are
++    /// never shown in its place.
++    let isGroupUrl: Bool
++
++    init(group: ClashProxy) {
++        // mihomo leaves testUrl empty for select groups without their own url
++        if let testUrl = group.testUrl, !testUrl.isEmpty {
++            url = testUrl
++            isGroupUrl = true
++        } else {
++            url = ConfigManager.shared.benchMarkUrl
++            isGroupUrl = false
++        }
++    }
++}
++
++extension ClashProxy {
++    /// Delay records for the source's URL. Without any, falls back to the
++    /// merged history of all URLs unless the group has its own url; cores
++    /// that don't report per-URL records always get the merged history.
++    func delayHistory(from source: ProxyDelaySource) -> [ClashProxySpeedHistory] {
++        guard let extra else { return history }
++        if let state = extra[source.url] { return state.history ?? [] }
++        return source.isGroupUrl ? [] : history
++    }
++
++    func isAlive(from source: ProxyDelaySource) -> Bool? {
++        guard let extra else { return alive }
++        if let state = extra[source.url] { return state.alive }
++        return source.isGroupUrl ? nil : alive
++    }
++}
++
+ class ClashProxyResp {
+     var proxies: [ClashProxy]
+ 
+diff --git a/ClashX/Views/ProxyDelayHistoryMenu.swift b/ClashX/Views/ProxyDelayHistoryMenu.swift
+index 8367e6b..97afc65 100644
+--- a/ClashX/Views/ProxyDelayHistoryMenu.swift
++++ b/ClashX/Views/ProxyDelayHistoryMenu.swift
+@@ -11,8 +11,10 @@ import FlexibleDiff
+ 
+ class ProxyDelayHistoryMenu: NSMenu {
+     var currentHistory: [ClashProxySpeedHistory]?
++    let delaySource: ProxyDelaySource
+ 
+-    init(proxy: ClashProxy) {
++    init(proxy: ClashProxy, delaySource: ProxyDelaySource) {
++        self.delaySource = delaySource
+         super.init(title: "")
+         updateHistoryMenu(proxy: proxy)
+         NotificationCenter.default.addObserver(self, selector: #selector(proxyInfoDidUpdate(note:)), name: .proxyUpdate(for: proxy.name), object: nil)
+@@ -33,7 +35,7 @@ class ProxyDelayHistoryMenu: NSMenu {
+     }
+ 
+     private func updateHistoryMenu(proxy: ClashProxy) {
+-        let historys = Array(proxy.history.reversed())
++        let historys = Array(proxy.delayHistory(from: delaySource).reversed())
+         let change = Changeset(previous: currentHistory, current: historys, identifier: { $0.time })
+         currentHistory = historys
+         if change.moves.isEmpty && change.mutations.isEmpty {
+diff --git a/ClashX/Views/ProxyGroupSpeedTestMenuItem.swift b/ClashX/Views/ProxyGroupSpeedTestMenuItem.swift
+index a405774..329f41f 100644
+--- a/ClashX/Views/ProxyGroupSpeedTestMenuItem.swift
++++ b/ClashX/Views/ProxyGroupSpeedTestMenuItem.swift
+@@ -45,7 +45,11 @@ class ProxyGroupSpeedTestMenuItem: NSMenuItem {
+     @objc func healthCheck() {
+         guard testType == .reTest else { return }
+ 		Task {
+-			_ = await ProxyHealthCheckManager.shared.getGroupDelay(groupName: proxyGroup.name)
++			_ = await ProxyHealthCheckManager.shared.getGroupDelay(
++				groupName: proxyGroup.name,
++				url: ProxyDelaySource(group: proxyGroup).url,
++				expectedStatus: proxyGroup.expectedStatus
++			)
+ 		}
+         menu?.cancelTracking()
+     }
+@@ -99,7 +103,10 @@ private class ProxyGroupSpeedTestMenuItemView: MenuItemBaseView {
+         enclosingMenuItem?.isEnabled = false
+         setNeedsDisplay()
+ 
+-        let delays = await ProxyHealthCheckManager.shared.getGroupDelay(groupName: group.name)
++        let testUrl = ProxyDelaySource(group: group).url
++        let delays = await ProxyHealthCheckManager.shared.getGroupDelay(groupName: group.name,
++                                                                        url: testUrl,
++                                                                        expectedStatus: group.expectedStatus)
+         guard let menu = enclosingMenuItem else { return }
+ 
+         group.all?.forEach { proxyName in
+@@ -114,6 +121,7 @@ private class ProxyGroupSpeedTestMenuItemView: MenuItemBaseView {
+                 name: .speedTestFinishForProxy,
+                 object: nil,
+                 userInfo: ["proxyName": proxyName,
++                           "testUrl": testUrl,
+                            "delay": delayStr,
+                            "rawValue": delay])
+         }
+diff --git a/ClashX/Views/ProxyItemView.swift b/ClashX/Views/ProxyItemView.swift
+index a030586..d5fd02f 100644
+--- a/ClashX/Views/ProxyItemView.swift
++++ b/ClashX/Views/ProxyItemView.swift
+@@ -17,7 +17,7 @@ class ProxyItemView: MenuItemBaseView {
+ 
+     static let fixedPlaceHolderWidth: CGFloat = 20 + 50 + 25
+ 
+-    init(proxy: ClashProxy) {
++    init(proxy: ClashProxy, delaySource: ProxyDelaySource) {
+ 		isBuiltInProxy = ClashProxyType.isBuiltInProxy(proxy)
+ 		
+         nameLabel = VibrancyTextField(labelWithString: proxy.name)
+@@ -50,7 +50,8 @@ class ProxyItemView: MenuItemBaseView {
+         delayLabel.layer?.cornerRadius = 2
+         delayLabel.textColor = NSColor.white
+ 
+-        update(str: proxy.history.last?.delayDisplay, value: proxy.history.last?.delay)
++        let last = proxy.delayHistory(from: delaySource).last
++        update(str: last?.delayDisplay, value: last?.delay)
+     }
+ 
+     override func layout() {
+diff --git a/ClashX/Views/ProxyMenuItem.swift b/ClashX/Views/ProxyMenuItem.swift
+index 79ed482..39e1e02 100644
+--- a/ClashX/Views/ProxyMenuItem.swift
++++ b/ClashX/Views/ProxyMenuItem.swift
+@@ -11,6 +11,7 @@ import Cocoa
+ class ProxyMenuItem: NSMenuItem {
+     let proxyName: String
+     let maxProxyNameLength: CGFloat
++    let delaySource: ProxyDelaySource
+ 
+     deinit {
+         NotificationCenter.default.removeObserver(self)
+@@ -25,6 +26,7 @@ class ProxyMenuItem: NSMenuItem {
+          action selector: Selector?,
+          simpleItem: Bool = false) {
+         proxyName = proxy.name
++        delaySource = ProxyDelaySource(group: group)
+         let isBuiltInProxy = ClashProxyType.isBuiltInProxy(proxy)
+ 
+         maxProxyNameLength = simpleItem ? 0 : group.maxProxyNameLength
+@@ -32,9 +34,9 @@ class ProxyMenuItem: NSMenuItem {
+         super.init(title: proxyName, action: selector, keyEquivalent: "")
+ 
+         if (!simpleItem && enableShowUsingView && group.isSpeedTestable) || isBuiltInProxy {
+-            view = ProxyItemView(proxy: proxy)
++            view = ProxyItemView(proxy: proxy, delaySource: delaySource)
+         } else if !simpleItem {
+-            attributedTitle = getAttributedTitle(name: proxyName, delay: proxy.history.last?.delayDisplay)
++            attributedTitle = getAttributedTitle(name: proxyName, delay: proxy.delayHistory(from: delaySource).last?.delayDisplay)
+         }
+         let selected = group.now == proxy.name
+         updateSelected(selected)
+@@ -63,6 +65,9 @@ class ProxyMenuItem: NSMenuItem {
+         guard let name = note.userInfo?["proxyName"] as? String, name == proxyName else {
+             return
+         }
++        if let url = note.userInfo?["testUrl"] as? String, url != delaySource.url {
++            return
++        }
+         if let delay = note.userInfo?["delay"] as? String {
+             updateDelay(delay, rawValue: note.userInfo?["rawValue"] as? Int)
+         }
+@@ -73,10 +78,11 @@ class ProxyMenuItem: NSMenuItem {
+             assertionFailure()
+             return
+         }
+-        if info.alive == false {
++        if info.isAlive(from: delaySource) == false {
+             updateDelay(NSLocalizedString("fail", comment: ""), rawValue: 0)
+         } else {
+-            updateDelay(info.history.last?.delayDisplay, rawValue: info.history.last?.delay)
++            let last = info.delayHistory(from: delaySource).last
++            updateDelay(last?.delayDisplay, rawValue: last?.delay)
+         }
+     }
+ 
+-- 
+2.50.1 (Apple Git-155)
+
