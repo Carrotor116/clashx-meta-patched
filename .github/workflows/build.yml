@@ -1,6 +1,9 @@
 name: Build patched ClashX Meta
 
 on:
+  push:
+    branches: [main]
+    paths: ['patches/**', '.github/workflows/build.yml']
   schedule:
     - cron: '23 2 * * *' # daily, UTC
   workflow_dispatch:
@@ -41,7 +44,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           INPUT_TAG: ${{ inputs.upstream_tag }}
-          FORCE: ${{ inputs.force }}
+          # changed patches always rebuild
+          FORCE: ${{ inputs.force || github.event_name == 'push' }}
         run: |
           tag="${INPUT_TAG:-$(gh release view -R "$UPSTREAM" --json tagName -q .tagName)}"
           if [ -z "$tag" ]; then
@@ -109,7 +113,7 @@ jobs:
             app=$(ls -d /Applications/Xcode_*.app | grep -v -i -E 'beta|release_candidate' | sort -V | tail -1)
           fi
           sudo xcode-select -s "$app/Contents/Developer"
-          xcodebuild -version
+          echo "::notice::$(xcodebuild -version | tr '\n' ' ')"
 
       - name: install deps
         working-directory: src
@@ -146,7 +150,21 @@ jobs:
       - name: build
         working-directory: src
         run: |
-          xcodebuild archive -project ClashX.xcodeproj -scheme ClashX\ Meta -archivePath archive/ClashX.xcarchive -showBuildTimingSummary -allowProvisioningUpdates
+          set -o pipefail
+          xcodebuild archive -project ClashX.xcodeproj -scheme ClashX\ Meta -archivePath archive/ClashX.xcarchive -showBuildTimingSummary -allowProvisioningUpdates 2>&1 | tee ../build.log || {
+            # annotations are readable without signing in, unlike job logs
+            grep -E '(error|fatal error): ' ../build.log | sed "s|$PWD/||" | sort -u | head -10 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+            exit 1
+          }
+
+      - name: upload build log
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build.log
+          path: build.log
 
       - name: create zip
         working-directory: src
